@@ -19,11 +19,13 @@ from wecom_common import (
     iter_databases,
     key_for_database,
     latest_snapshot,
+    load_config,
     load_key_file,
     utc_now,
     vault_root,
 )
 from wecom_crypto import PAGE_SIZE, database_format, decrypt_database
+from wecom_media import MediaCache, media_for_message
 
 
 MESSAGE_TABLES = ("message_table", "message_small_table", "kf_message_tableV1")
@@ -31,13 +33,17 @@ CORE_NAMES = ("message.db", "session.db", "user.db")
 TYPE_NAMES = {
     0: "文本/混合",
     2: "文本",
-    4: "图片",
+    4: "聊天记录(合并转发)",
     7: "语音",
+    14: "图片",
     15: "图片/文件",
+    16: "语音",
+    22: "视频",
     38: "应用消息",
     40: "通话/音视频",
     503: "状态",
     1011: "会议通知",
+    123: "图文混排",
 }
 
 
@@ -277,7 +283,16 @@ def resolve_session(query: str, sessions: dict[str, dict]) -> dict:
     return matches[0]
 
 
-def iter_messages(snapshot: Path, conversation_id: str | None, start: int | None, end: int | None, keyword: str | None, limit: int) -> list[dict]:
+def iter_messages(
+    snapshot: Path,
+    conversation_id: str | None,
+    start: int | None,
+    end: int | None,
+    keyword: str | None,
+    limit: int,
+    media_cache: MediaCache | None = None,
+    verify_md5: bool = False,
+) -> list[dict]:
     path = snapshot / "message.db"
     if not path.exists():
         raise SystemExit(f"快照缺少 message.db: {snapshot}")
@@ -320,7 +335,7 @@ def iter_messages(snapshot: Path, conversation_id: str | None, start: int | None
                 display_content = content or f"[{TYPE_NAMES.get(content_type, f'未知类型 {content_type}')}]"
                 if keyword and keyword.lower() not in display_content.lower():
                     continue
-                messages.append({
+                message = {
                     "source_table": table,
                     "message_id": int(item.get("message_id") or 0),
                     "server_id": int(item.get("server_id") or 0),
@@ -334,7 +349,12 @@ def iter_messages(snapshot: Path, conversation_id: str | None, start: int | None
                     "send_time": int(item.get("send_time") or 0),
                     "time": format_time(item.get("send_time")),
                     "content": display_content,
-                })
+                }
+                if media_cache is not None:
+                    media = media_for_message(item.get("content"), content_type, media_cache, verify_md5)
+                    if media:
+                        message["media"] = media
+                messages.append(message)
     messages.sort(key=lambda item: (item["send_time"], item["sequence"], item["message_id"]))
     return messages[-limit:]
 
@@ -423,9 +443,18 @@ def command_contacts(args) -> None:
     output({"count": min(len(users), args.limit), "contacts": users[: args.limit]})
 
 
-def messages_for_args(args) -> tuple[dict | None, list[dict]]:
+def media_cache_for_args(args) -> MediaCache:
+    root = getattr(args, "cache_root", None) or load_config().get("cache_root")
+    cache = MediaCache(root)
+    if not cache.caches:
+        raise SystemExit(f"找不到企业微信媒体缓存目录: {cache.root}；可用 --cache-root 指定 Profiles、单个账号或 Caches 目录")
+    return cache
+
+
+def messages_for_args(args, *, with_media: bool | None = None) -> tuple[dict | None, list[dict]]:
     snapshot = snapshot_path(args.snapshot)
     session = resolve_session(args.chat, load_sessions(snapshot)) if getattr(args, "chat", None) else None
+    with_media = getattr(args, "media", False) if with_media is None else with_media
     messages = iter_messages(
         snapshot,
         session["conversation_id"] if session else None,
@@ -433,6 +462,8 @@ def messages_for_args(args) -> tuple[dict | None, list[dict]]:
         parse_time(args.end),
         getattr(args, "keyword", None),
         args.limit,
+        media_cache_for_args(args) if with_media else None,
+        getattr(args, "verify_md5", False),
     )
     return session, messages
 
@@ -476,16 +507,77 @@ def command_export(args) -> None:
             for message in messages:
                 content = message["content"].replace("\n", "\n  ")
                 handle.write(f"- {message['time']} · {message['sender']}\n  {content}\n")
+                for media in message.get("media", []):
+                    handle.write(f"  - {media_line(media)}\n")
     os.chmod(destination, 0o600)
     output({"output": str(destination), "messages": len(messages), "contains_plaintext_wecom_data": True})
 
 
-def add_message_filters(parser, *, chat_required: bool) -> None:
+def media_line(media: dict) -> str:
+    name = media.get("name") or "未命名"
+    local = media.get("local")
+    where = f" → {local['path']}" if local else ""
+    return f"[{media['kind_label']}·{media['status_label']}] {name}{where}"
+
+
+ATTENTION_STATUSES = {"preview_only", "thumbnail_only", "cover_only", "missing"}
+
+
+def command_media(args) -> None:
+    session, messages = messages_for_args(args, with_media=True)
+    summary: dict[str, dict[str, int]] = {}
+    by_conversation: dict[str, dict] = {}
+    attention = []
+    for message in messages:
+        for media in message.get("media", []):
+            summary.setdefault(media["kind"], {}).setdefault(media["status"], 0)
+            summary[media["kind"]][media["status"]] += 1
+            row = by_conversation.setdefault(message["conversation_id"], {
+                "conversation_id": message["conversation_id"],
+                "conversation": message["conversation"],
+                "media": 0,
+                "needs_attention": 0,
+            })
+            row["media"] += 1
+            if media["status"] in ATTENTION_STATUSES:
+                row["needs_attention"] += 1
+                attention.append({
+                    "time": message["time"],
+                    "conversation": message["conversation"],
+                    "conversation_id": message["conversation_id"],
+                    "sender": message["sender"],
+                    "message_id": message["message_id"],
+                    "kind": media["kind_label"],
+                    "name": media.get("name"),
+                    "status": media["status"],
+                    "status_label": media["status_label"],
+                })
+    conversations = sorted(by_conversation.values(), key=lambda row: (-row["needs_attention"], -row["media"]))
+    attention.reverse()
+    output({
+        "session": session,
+        "messages_scanned": len(messages),
+        "summary": summary,
+        "conversations": conversations,
+        "needs_attention_count": len(attention),
+        "needs_attention": attention[: args.items],
+        "note": "只统计客户端已下载到本机的媒体；打开对应会话后重新运行可补齐原图。",
+    })
+
+
+def add_message_filters(parser, *, chat_required: bool, default_limit: int = 200) -> None:
     parser.add_argument("chat" if chat_required else "--chat", help="会话名称或 conversation_id")
     parser.add_argument("--snapshot")
     parser.add_argument("--start")
     parser.add_argument("--end")
-    parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--limit", type=int, default=default_limit)
+
+
+def add_media_options(parser, *, toggle: bool) -> None:
+    if toggle:
+        parser.add_argument("--media", action="store_true", help="关联企业微信本机缓存里的图片、文件、语音和视频")
+    parser.add_argument("--cache-root", help="Profiles、单个账号或 Caches 目录；默认企业微信容器里的 Profiles")
+    parser.add_argument("--verify-md5", action="store_true", help="对原图、文件和语音计算 MD5 并与消息记录核对")
 
 
 def main() -> int:
@@ -522,18 +614,27 @@ def main() -> int:
 
     command = sub.add_parser("history", help="查询指定会话历史")
     add_message_filters(command, chat_required=True)
+    add_media_options(command, toggle=True)
     command.set_defaults(func=command_history)
 
     command = sub.add_parser("search", help="全文搜索已解密消息")
     command.add_argument("keyword")
     add_message_filters(command, chat_required=False)
+    add_media_options(command, toggle=True)
     command.set_defaults(func=command_search)
 
     command = sub.add_parser("export", help="导出指定会话")
     add_message_filters(command, chat_required=True)
+    add_media_options(command, toggle=True)
     command.add_argument("--format", choices=("markdown", "json"), default="markdown")
     command.add_argument("--output")
     command.set_defaults(func=command_export)
+
+    command = sub.add_parser("media", help="统计媒体在本机缓存的覆盖情况，列出只有预览图或本地没有的媒体")
+    add_message_filters(command, chat_required=False, default_limit=20000)
+    add_media_options(command, toggle=False)
+    command.add_argument("--items", type=int, default=50, help="最多列出多少条需要处理的媒体")
+    command.set_defaults(func=command_media)
 
     args = parser.parse_args()
     if getattr(args, "limit", 1) < 1:

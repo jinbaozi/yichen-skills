@@ -1,6 +1,6 @@
 ---
 name: yichen-wecom-local-vault
-description: Read, decrypt, query, search, and export local WeCom/企业微信 5.x desktop databases on macOS into a private read-only vault. Use when the user asks to parse 企业微信本地数据、企微聊天记录、WeCom/WXWork contacts, sessions, groups, customers, message history, local database backup, structured export, or a Mac enterprise-WeChat data analysis workflow.
+description: Read, decrypt, query, search, and export local WeCom/企业微信 5.x desktop databases on macOS into a private read-only vault, and match message images, files, voice and video to the client's local cache. Use when the user asks to parse 企业微信本地数据、企微聊天记录、企微图片/文件/原图、WeCom/WXWork contacts, sessions, groups, customers, message history, local database backup, structured export, or a Mac enterprise-WeChat data analysis workflow.
 ---
 
 # yichen-wecom-local-vault：企业微信本地数据 Vault
@@ -34,6 +34,7 @@ python3 "$SKILL_DIR/scripts/vault_cli.py" status
 3. 缺少 key：先说明需要明确授权捕获；可选只读 attach，若 macOS 拒绝 `task_for_pid`，再使用重签副本捕获。
 4. 已有快照：直接用 `sessions`、`contacts`、`history`、`search`、`export`，不要重新解密。
 5. 用户指定会话或时间范围：只查询该范围；消息较多时先落 Markdown/JSON 文件。
+6. 用户要图片、文件、语音、视频本体，或问哪些图还没下载：用 `history/search/export --media` 或 `media` 命令；只读本机缓存，不打开客户端。
 
 ## 数据库发现与检查
 
@@ -119,10 +120,33 @@ python3 "$SKILL_DIR/scripts/vault_cli.py" export "群名" \
 
 默认读取最新快照；需要固定证据版本时传 `--snapshot`。导出默认写入私密 Vault 的 `exports/`，文件权限为 `0600`，已有目标文件一律拒绝覆盖。
 
+## 关联本机媒体
+
+```bash
+# 给每条消息附上本机缓存里的图片、文件、语音、视频路径和状态
+python3 "$SKILL_DIR/scripts/vault_cli.py" history "群名" --media --limit 500
+python3 "$SKILL_DIR/scripts/vault_cli.py" export "群名" --media --format markdown
+# 需要证明文件未被改动时再加 --verify-md5（逐个计算 MD5，大文件较慢）
+python3 "$SKILL_DIR/scripts/vault_cli.py" history "群名" --media --verify-md5
+
+# 覆盖率报告：按类型和会话统计，列出只有预览图、只有缩略图或本地没有的媒体
+python3 "$SKILL_DIR/scripts/vault_cli.py" media --start "2026-10-01" --items 50
+python3 "$SKILL_DIR/scripts/vault_cli.py" media --chat "群名"
+```
+
+- 匹配依据是消息里记录的原文件 MD5，不靠文件名，所以同名文件、`name(1).ext` 不会配错；`size_match` 核对大小，`--verify-md5` 核对内容。
+- 缓存文件可能被人在本机打开后原地保存而改动（实测一份 `.doc` 收到当天被改小）。用作对账或证据时必须加 `--verify-md5`，`md5_match: false` 的文件不能当作收到的原件。
+- 图片状态：`original` 原图已在本地（`_HD` 层，内容与发送方原文件一致）；`preview_only` 只有压缩预览图；`thumbnail_only` 只有缩略图；`missing` 本地没有。文件、语音、视频为 `downloaded` 或 `missing`，视频另有 `cover_only`。
+- 默认索引 `~/Library/Containers/com.tencent.WeWorkMac/Data/Documents/Profiles` 下所有账号的 `Caches`，优先当前账号；`--cache-root` 或配置文件的 `cache_root` 可指定 Profiles、单个账号或 `Caches` 目录。结果里的 `profile` 只显示账号目录前 8 位。
+- 输出含本机绝对路径；回复用户时只报文件名、状态和数量，不整段贴路径。
+- 快照里没有的新消息不会出现在结果里；需要最新数据时先运行 `decrypt` 创建新快照。
+
 ## 已知限制
 
+- **媒体只能拿到客户端已经下载到本机的版本。** 实测客户端在会话被打开时才下载图片（预览图和原图同时落地）；没人打开过的会话可能只有缩略图，甚至什么都没有。先跑 `media` 列出缺口，由用户本人打开对应会话后再查；本 Skill 不替用户点击或下载。本机缓存里也找不到的文件，再改用 `$yichen-wecom-operations`（微盘下载）。
+- 语音缓存是客户端原始 `.dat` 数据，本 Skill 只给路径，不转码、不转写。
 - Mac key 捕获依赖企业微信实际打开/读写加密数据库；如果捕获期间没有触发 wxSQLite3 页加解密调用，可能抓不到 key。
-- 消息二进制内容采用通用 UTF-8/Protobuf 文本提取；图片、语音、文件正文目前只输出类型占位，不解密媒体。
+- 消息二进制内容采用通用 UTF-8/Protobuf 文本提取；不加 `--media` 时图片、语音、文件只输出类型占位。媒体字段结构见 database-notes 的「媒体描述与本机缓存」。
 - 会话方向需要可靠的本人内部 ID；未确认时不要把发送者武断标记为“我”。
 - 企业微信版本升级可能改变密钥调用或表结构；先运行离线测试和 `status` 再处理真实数据。
 

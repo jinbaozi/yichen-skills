@@ -137,6 +137,7 @@ See [yichen-wechat-mp-batch-exporter/README.md](./yichen-wechat-mp-batch-exporte
 Read, decrypt, query, and export local WeCom/企业微信 5.x desktop databases on macOS:
 - Creates private, timestamped plaintext snapshots and never writes back to the WeCom container
 - Supports contacts, sessions, message history, search, and Markdown/JSON export
+- Matches message images, files, voice, and video to the client's local cache by MD5, and lists media that is still only a preview or missing
 - Keeps raw keys, snapshots, and chat exports out of Git
 - Does not control the original WeCom app or send messages
 
